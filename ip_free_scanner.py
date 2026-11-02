@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import queue
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 from concurrent.futures import ThreadPoolExecutor
@@ -21,12 +22,21 @@ from concurrent.futures import ThreadPoolExecutor
 # ---------------- 版本信息 ----------------
 APP_NAME = "智策学校局域网配置软件"
 APP_NAME_EN = "zc-IPFreeScanner"
-APP_VERSION = "v1.0"
+APP_VERSION = "v1.1"
 SUBNET_PREFIX = "192.168.168"     # 目标网段
 SUBNET_MASK = "255.255.255.0"
 DEFAULT_GATEWAY = "192.168.168.1"  # 检测失败时的兜底网关
-DNS_PRIMARY = "223.5.5.5"
-DNS_SECONDARY = "114.114.114.114"
+
+# 国内主流 DNS 预设:(名称, 主 DNS, 备 DNS)
+DNS_PRESETS = [
+    ("阿里 AliDNS",      "223.5.5.5",      "223.6.6.6"),
+    ("腾讯 DNSPod",      "119.29.29.29",   "182.254.116.116"),
+    ("114DNS",           "114.114.114.114", "114.114.115.115"),
+    ("百度 DNS",         "180.76.76.76",   "180.76.76.76"),
+    ("360 DNS",          "101.226.4.6",    "123.125.81.6"),
+    ("火山引擎",         "180.184.1.1",    "180.184.2.2"),
+    ("CNNIC SDNS",       "1.2.4.8",        "210.2.4.8"),
+]
 PING_TIMEOUT_MS = 600
 WORKERS = 64
 
@@ -210,6 +220,20 @@ class App(tk.Tk):
                                     foreground="#0a7d32")
         self.lbl_router.pack(anchor="w")
 
+        frm_dns = ttk.Frame(frm_top)
+        frm_dns.pack(fill="x", pady=(4, 0))
+        ttk.Label(frm_dns, text="DNS 预设:").pack(side="left")
+        self.dns_var = tk.StringVar(value=DNS_PRESETS[0][0])
+        self.cmb_dns = ttk.Combobox(frm_dns, textvariable=self.dns_var,
+                                    values=[p[0] for p in DNS_PRESETS],
+                                    state="readonly", width=16)
+        self.cmb_dns.pack(side="left", padx=6)
+        self.lbl_dns_detail = ttk.Label(
+            frm_dns, foreground="#666",
+            text=f"主 {DNS_PRESETS[0][1]}  备 {DNS_PRESETS[0][2]}")
+        self.lbl_dns_detail.pack(side="left", padx=6)
+        self.cmb_dns.bind("<<ComboboxSelected>>", self.on_dns_change)
+
         self.btn_scan = ttk.Button(frm_top, text="开始扫描 192.168.168.x 网段",
                                    command=self.start_scan)
         self.btn_scan.pack(fill="x", pady=(6, 0))
@@ -248,8 +272,8 @@ class App(tk.Tk):
         self.lbl_info = ttk.Label(
             self, foreground="#666", justify="left",
             text=(f"{APP_NAME} {APP_VERSION} ({APP_NAME_EN})\n"
-                  f"写入内容: IP + 掩码 {SUBNET_MASK} + 自动检测到的网关 + DNS\n"
-                  f"DNS: {DNS_PRIMARY} / {DNS_SECONDARY}  |  写入时网络会短暂中断。"))
+                  f"写入内容: IP + 掩码 {SUBNET_MASK} + 自动检测到的网关 + 所选 DNS\n"
+                  f"提示: 路由器地址显示后,点击它可直接打开路由器管理页面。"))
         self.lbl_info.pack(anchor="w", padx=10, pady=(0, 8))
 
     # ---------- 初始化 ----------
@@ -302,8 +326,12 @@ class App(tk.Tk):
                     if gw:
                         state = "✅ 可达" if gw_ok else "⚠️ 暂不可达"
                         self.lbl_router.config(
-                            text=f"路由器(网关): {gw}   {state}",
-                            foreground="#0a7d32" if gw_ok else "#b45309")
+                            text=f"路由器(网关): {gw}   {state}"
+                                 f"   🔗 点击打开管理页面",
+                            foreground="#0a7d32" if gw_ok else "#b45309",
+                            cursor="hand2")
+                        self.lbl_router.bind("<Button-1>",
+                                             lambda e: self.open_router_page())
                     else:
                         self.lbl_router.config(
                             text="路由器(网关): 未检测到(写入时将使用 "
@@ -332,10 +360,33 @@ class App(tk.Tk):
                     else:
                         messagebox.showinfo("结果", "未发现空闲 IP,请检查网段或网络。")
                 elif kind == "apply_done":
-                    self._handle_apply_done(msg[1])
+                    self._handle_apply_done(msg[1], msg[2])
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
+
+    # ---------- 路由器管理页 / DNS 切换 ----------
+    def open_router_page(self):
+        """用默认浏览器打开路由器管理页面。"""
+        gw = self.gateway or DEFAULT_GATEWAY
+        url = f"http://{gw}"
+        try:
+            webbrowser.open(url)
+            self.lbl_status.config(text=f"状态: 已在浏览器打开 {url}")
+        except Exception as e:
+            messagebox.showerror("打开失败", f"无法打开 {url}\n\n{e}")
+
+    def get_selected_dns(self):
+        """返回当前所选 DNS 预设 (名称, 主, 备)。"""
+        name = self.dns_var.get()
+        for p in DNS_PRESETS:
+            if p[0] == name:
+                return p
+        return DNS_PRESETS[0]
+
+    def on_dns_change(self, _evt=None):
+        p = self.get_selected_dns()
+        self.lbl_dns_detail.config(text=f"主 {p[1]}  备 {p[2]}")
 
     # ---------- 选择 ----------
     def on_list_select(self, _evt=None):
@@ -370,13 +421,14 @@ class App(tk.Tk):
             messagebox.showerror("错误", "未检测到活动网卡,无法写入。")
             return
         gw = self.gateway or DEFAULT_GATEWAY
+        dns = self.get_selected_dns()
         ok = messagebox.askyesno(
             "确认写入",
             f"即将把网卡【{nic}】设置为静态 IP:\n\n"
             f"  IP 地址:  {self.chosen_ip}\n"
             f"  子网掩码: {SUBNET_MASK}\n"
             f"  默认网关: {gw} (自动检测到的路由器)\n"
-            f"  DNS:      {DNS_PRIMARY} / {DNS_SECONDARY}\n\n"
+            f"  DNS:      {dns[0]}  {dns[1]} / {dns[2]}\n\n"
             f"⚠ 写入过程中网络会短暂中断,确认继续?",
         )
         if not ok:
@@ -393,17 +445,17 @@ class App(tk.Tk):
             ], timeout=30))
             results.append(run_cmd([
                 "netsh", "interface", "ip", "set", "dns",
-                f"name={nic}", "static", DNS_PRIMARY, "primary",
+                f"name={nic}", "static", dns[1], "primary",
             ], timeout=30))
             results.append(run_cmd([
                 "netsh", "interface", "ip", "add", "dns",
-                f"name={nic}", DNS_SECONDARY, "index=2",
+                f"name={nic}", dns[2], "index=2",
             ], timeout=30))
-            self.msg_q.put(("apply_done", results))
+            self.msg_q.put(("apply_done", results, dns))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _handle_apply_done(self, results):
+    def _handle_apply_done(self, results, dns):
         failed = [(i, r) for i, r in enumerate(results) if r[0] != 0]
         if not failed:
             self.lbl_status.config(text="状态: 写入成功 ✅")
@@ -411,7 +463,7 @@ class App(tk.Tk):
                 "写入成功",
                 f"静态 IP 已写入:\n{self.chosen_ip} / {SUBNET_MASK}\n"
                 f"网关 {self.gateway or DEFAULT_GATEWAY}  "
-                f"DNS {DNS_PRIMARY} / {DNS_SECONDARY}")
+                f"DNS {dns[0]} {dns[1]} / {dns[2]}")
         else:
             detail = "\n".join(f"步骤{i+1} rc={r[0]}: {r[1][:120]}" for i, r in failed)
             self.lbl_status.config(text="状态: 写入失败 ❌")
