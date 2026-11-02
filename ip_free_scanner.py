@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 智策学校局域网配置软件 (zc-IPFreeScanner)
-版本: v1.0
-功能: ① 自动检测当前电脑连接的路由器(网关)地址
-      ② 扫描 192.168.168.0/24 网段空闲 IP (Ping + ARP 双重检测)
-      ③ 展示列表 -> 随机抽取 -> 用户确认后写入 Windows 静态 IP
+版本: v1.2
+功能: ① 自动检测当前电脑连接的路由器(网关)地址,点击可打开管理页面
+      ② 网段切换: 192.168.168.x / 192.168.200.x
+      ③ 扫描所选网段空闲 IP (Ping + ARP 双重检测)
+      ④ 展示列表 -> 随机抽取 -> 用户确认后写入 Windows 静态 IP(DNS 预设可选)
 """
 
 import ctypes
@@ -22,10 +23,13 @@ from concurrent.futures import ThreadPoolExecutor
 # ---------------- 版本信息 ----------------
 APP_NAME = "智策学校局域网配置软件"
 APP_NAME_EN = "zc-IPFreeScanner"
-APP_VERSION = "v1.1"
-SUBNET_PREFIX = "192.168.168"     # 目标网段
+APP_VERSION = "v1.2"
 SUBNET_MASK = "255.255.255.0"
-DEFAULT_GATEWAY = "192.168.168.1"  # 检测失败时的兜底网关
+# 可切换网段: (显示名, 网段前缀, 兜底网关)
+SUBNETS = [
+    ("192.168.168.x", "192.168.168", "192.168.168.1"),
+    ("192.168.200.x", "192.168.200", "192.168.200.1"),
+]
 
 # 国内主流 DNS 预设:(名称, 主 DNS, 备 DNS)
 DNS_PRESETS = [
@@ -123,12 +127,12 @@ def get_active_adapter():
     return nic, (ip if ip else None)
 
 
-def get_arp_ips():
-    """从系统 ARP 表解析 192.168.168.x 段已占用 IP(排除广播/空 MAC)。"""
+def get_arp_ips(prefix):
+    """从系统 ARP 表解析指定网段已占用 IP(排除广播/空 MAC)。"""
     _, out = run_cmd(["arp", "-a"], timeout=10)
     ips = set()
     pat = re.compile(
-        r"^(" + re.escape(SUBNET_PREFIX) + r"\.\d+)\s+"
+        r"^(" + re.escape(prefix) + r"\.\d+)\s+"
         r"([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}", re.M
     )
     for m in pat.finditer(out):
@@ -147,13 +151,13 @@ def ping_ip(ip):
     return rc == 0
 
 
-def scan_subnet(progress_cb=None, cancel_event=None):
+def scan_subnet(prefix, progress_cb=None, cancel_event=None):
     """
-    扫描网段,返回 (free_ips, occupied_ips)。
+    扫描指定网段,返回 (free_ips, occupied_ips)。
     检测逻辑: ping 响应 或 出现在 ARP 表 => 占用。
     """
-    all_ips = [f"{SUBNET_PREFIX}.{i}" for i in range(1, 255)]
-    arp_before = get_arp_ips()
+    all_ips = [f"{prefix}.{i}" for i in range(1, 255)]
+    arp_before = get_arp_ips(prefix)
 
     occupied = set(arp_before)
     done = 0
@@ -180,8 +184,8 @@ def scan_subnet(progress_cb=None, cancel_event=None):
     own_ip = getattr(scan_subnet, "_own_ip", None)
     if own_ip:
         occupied.add(own_ip)
-    occupied.add(f"{SUBNET_PREFIX}.1")   # 保留给网关,避免冲突
-    occupied.add(f"{SUBNET_PREFIX}.255")
+    occupied.add(f"{prefix}.1")   # 保留给网关,避免冲突
+    occupied.add(f"{prefix}.255")
 
     free = [ip for ip in all_ips if ip not in occupied]
     return free, sorted(occupied, key=lambda x: int(x.rsplit(".", 1)[1]))
@@ -216,9 +220,19 @@ class App(tk.Tk):
 
         self.lbl_adapter = ttk.Label(frm_top, text="网卡: 检测中…")
         self.lbl_adapter.pack(anchor="w")
+
+        frm_net = ttk.Frame(frm_top)
+        frm_net.pack(fill="x", pady=(4, 0))
+        ttk.Label(frm_net, text="目标网段:").pack(side="left")
+        self.subnet_var = tk.StringVar(value=SUBNETS[0][0])
+        self.cmb_subnet = ttk.Combobox(frm_net, textvariable=self.subnet_var,
+                                       values=[s[0] for s in SUBNETS],
+                                       state="readonly", width=16)
+        self.cmb_subnet.pack(side="left", padx=6)
+        self.cmb_subnet.bind("<<ComboboxSelected>>", self.on_subnet_change)
         self.lbl_router = ttk.Label(frm_top, text="路由器(网关): 检测中…",
                                     foreground="#0a7d32")
-        self.lbl_router.pack(anchor="w")
+        self.lbl_router.pack(anchor="w", pady=(4, 0))
 
         frm_dns = ttk.Frame(frm_top)
         frm_dns.pack(fill="x", pady=(4, 0))
@@ -234,7 +248,7 @@ class App(tk.Tk):
         self.lbl_dns_detail.pack(side="left", padx=6)
         self.cmb_dns.bind("<<ComboboxSelected>>", self.on_dns_change)
 
-        self.btn_scan = ttk.Button(frm_top, text="开始扫描 192.168.168.x 网段",
+        self.btn_scan = ttk.Button(frm_top, text="开始扫描所选网段",
                                    command=self.start_scan)
         self.btn_scan.pack(fill="x", pady=(6, 0))
 
@@ -298,6 +312,7 @@ class App(tk.Tk):
         self.btn_scan.config(state="disabled", text="扫描中…请稍候")
         self.btn_pick.config(state="disabled")
         self.btn_apply.config(state="disabled")
+        self.cmb_subnet.config(state="disabled")
         self.listbox.delete(0, "end")
         self.free_ips = []
         self.chosen_ip = None
@@ -306,9 +321,12 @@ class App(tk.Tk):
         threading.Thread(target=self._scan_worker, daemon=True).start()
 
     def _scan_worker(self):
+        prefix = self._current_subnet()[1]
+
         def cb(done, total):
             self.msg_q.put(("progress", done, total))
-        free, occupied = scan_subnet(progress_cb=cb, cancel_event=self.cancel_event)
+        free, occupied = scan_subnet(prefix, progress_cb=cb,
+                                     cancel_event=self.cancel_event)
         self.msg_q.put(("scan_done", free, occupied))
 
     # ---------- 队列轮询 ----------
@@ -335,7 +353,7 @@ class App(tk.Tk):
                     else:
                         self.lbl_router.config(
                             text="路由器(网关): 未检测到(写入时将使用 "
-                                 f"{DEFAULT_GATEWAY})",
+                                 f"{self.default_gw()})",
                             foreground="#b45309")
                 elif kind == "progress":
                     done, total = msg[1], msg[2]
@@ -345,6 +363,7 @@ class App(tk.Tk):
                     free, occupied = msg[1], msg[2]
                     self.scanning = False
                     self.btn_scan.config(state="normal", text="重新扫描")
+                    self.cmb_subnet.config(state="readonly")
                     if free is None:
                         self.lbl_status.config(text="状态: 已取消")
                         return
@@ -368,7 +387,7 @@ class App(tk.Tk):
     # ---------- 路由器管理页 / DNS 切换 ----------
     def open_router_page(self):
         """用默认浏览器打开路由器管理页面。"""
-        gw = self.gateway or DEFAULT_GATEWAY
+        gw = self.gateway or self.default_gw()
         url = f"http://{gw}"
         try:
             webbrowser.open(url)
@@ -387,6 +406,33 @@ class App(tk.Tk):
     def on_dns_change(self, _evt=None):
         p = self.get_selected_dns()
         self.lbl_dns_detail.config(text=f"主 {p[1]}  备 {p[2]}")
+
+    # ---------- 网段切换 ----------
+    def _current_subnet(self):
+        """返回当前所选网段 (显示名, 前缀, 兜底网关)。"""
+        name = self.subnet_var.get()
+        for s in SUBNETS:
+            if s[0] == name:
+                return s
+        return SUBNETS[0]
+
+    def default_gw(self):
+        """当前网段的兜底网关(自动检测失败时使用)。"""
+        return self._current_subnet()[2]
+
+    def on_subnet_change(self, _evt=None):
+        """切换网段后清空旧结果,提示重新扫描。"""
+        if self.scanning:
+            return
+        self.listbox.delete(0, "end")
+        self.free_ips = []
+        self.chosen_ip = None
+        self.lbl_chosen.config(text="未选择")
+        self.lbl_count.config(text="共 0 个空闲 IP")
+        self.btn_pick.config(state="disabled")
+        self.btn_apply.config(state="disabled")
+        self.lbl_status.config(
+            text=f"状态: 已切换到 {self._current_subnet()[0]},请重新扫描 ✅")
 
     # ---------- 选择 ----------
     def on_list_select(self, _evt=None):
@@ -420,7 +466,7 @@ class App(tk.Tk):
         if not nic:
             messagebox.showerror("错误", "未检测到活动网卡,无法写入。")
             return
-        gw = self.gateway or DEFAULT_GATEWAY
+        gw = self.gateway or self.default_gw()
         dns = self.get_selected_dns()
         ok = messagebox.askyesno(
             "确认写入",
@@ -462,7 +508,7 @@ class App(tk.Tk):
             messagebox.showinfo(
                 "写入成功",
                 f"静态 IP 已写入:\n{self.chosen_ip} / {SUBNET_MASK}\n"
-                f"网关 {self.gateway or DEFAULT_GATEWAY}  "
+                f"网关 {self.gateway or self.default_gw()}  "
                 f"DNS {dns[0]} {dns[1]} / {dns[2]}")
         else:
             detail = "\n".join(f"步骤{i+1} rc={r[0]}: {r[1][:120]}" for i, r in failed)
